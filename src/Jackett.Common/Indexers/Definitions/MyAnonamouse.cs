@@ -60,35 +60,7 @@ namespace Jackett.Common.Indexers.Definitions
                     BookSearchParam.Q
                 }
             };
-            // Category mappings are extensive and unchanged, so they are omitted here for brevity.
-            // The actual file should retain them as they were.
-            return caps;
-        }
 
-        public override async Task<IndexerConfigurationStatus> ApplyConfiguration(JToken configJson)
-        {
-            LoadValuesFromJson(configJson);
-
-            CookieHeader = "mam_id=" + configData.MamId.Value;
-            try
-            {
-                var results = await PerformQuery(new TorznabQuery());
-                if (!results.Any())
-                    throw new Exception("Your man_id did not work");
-
-                IsConfigured = true;
-                SaveConfig();
-                return IndexerConfigurationStatus.Completed;
-            }
-            catch (Exception e)
-            {
-                IsConfigured = false;
-                throw new Exception("Your man_id did not work: " + e.Message);
-            }
-        }
-
-        protected override async Task<IEnumerable<ReleaseInfo>> PerformQuery(TorznabQuery query)
-        {
             caps.Categories.AddCategoryMapping("13", TorznabCatType.AudioAudiobook, "AudioBooks");
             caps.Categories.AddCategoryMapping("14", TorznabCatType.BooksEBook, "E-Books");
             caps.Categories.AddCategoryMapping("15", TorznabCatType.AudioAudiobook, "Musicology");
@@ -183,7 +155,220 @@ namespace Jackett.Common.Indexers.Definitions
             caps.Categories.AddCategoryMapping("130", TorznabCatType.AudioAudiobook, "Radio - Drama");
             caps.Categories.AddCategoryMapping("128", TorznabCatType.AudioAudiobook, "Radio - Factual/Documentary");
             caps.Categories.AddCategoryMapping("132", TorznabCatType.AudioAudiobook, "Radio - Reading");
+
+            return caps;
+        }
+
+        public override async Task<IndexerConfigurationStatus> ApplyConfiguration(JToken configJson)
+        {
+            LoadValuesFromJson(configJson);
+
+            CookieHeader = "mam_id=" + configData.MamId.Value;
+            try
+            {
+                var results = await PerformQuery(new TorznabQuery());
+                if (!results.Any())
+                {
+                    throw new Exception("Your man_id did not work");
+                }
+
+                IsConfigured = true;
+                SaveConfig();
+                return IndexerConfigurationStatus.Completed;
+            }
+            catch (Exception e)
+            {
+                IsConfigured = false;
+                throw new Exception("Your man_id did not work: " + e.Message);
+            }
+        }
+
+        protected override async Task<IEnumerable<ReleaseInfo>> PerformQuery(TorznabQuery query)
+        {
             var releases = new List<ReleaseInfo>();
+
+            var term = _SanitizeSearchQueryRegex.Replace(query.GetQueryString(), " ").Trim();
+
+            if (query.SearchTerm.IsNotNullOrWhiteSpace() && term.IsNullOrWhiteSpace())
+            {
+                logger.Debug("Search term is empty after being sanitized, stopping search. Initial search term: '{0}'", query.SearchTerm);
+
+                return releases;
+            }
+
+            var limit = query.Limit > 0 ? query.Limit : 100;
+            var offset = query.Offset > 0 ? query.Offset : 0;
+
+            var parameters = new NameValueCollection
+            {
+                {"tor[text]", term},
+                {"tor[searchType]", configData.SearchType.Value},
+                {"tor[srchIn][title]", "true"},
+                {"tor[srchIn][author]", "true"},
+                {"tor[srchIn][narrator]", "true"},
+                {"tor[searchIn]", "torrents"},
+                {"tor[sortType]", "default"},
+                {"tor[perpage]", limit.ToString()},
+                {"tor[startNumber]", offset.ToString()},
+                {"thumbnails", "1"}, // gives links for thumbnail sized versions of their posters
+                {"description", "1"} // include the description
+            };
+
+            if (configData.SearchInDescription.Value)
+            {
+                parameters.Add("tor[srchIn][description]", "true");
+            }
+
+            if (configData.SearchInSeries.Value)
+            {
+                parameters.Add("tor[srchIn][series]", "true");
+            }
+
+            if (configData.SearchInFilenames.Value)
+            {
+                parameters.Add("tor[srchIn][filenames]", "true");
+            }
+
+            if (configData.SearchLanguages.Values is { Length: > 0 })
+            {
+                var searchLanguages = configData.SearchLanguages.Values.Where(l => l != null);
+
+                foreach (var (language, index) in searchLanguages.Select((value, index) => (value, index)))
+                {
+                    parameters.Set($"tor[browse_lang][{index}]", language);
+                }
+            }
+
+            var catList = MapTorznabCapsToTrackers(query).Distinct().ToList();
+
+            if (catList.Any())
+            {
+                foreach (var (category, index) in catList.Select((value, index) => (value, index)))
+                {
+                    parameters.Set($"tor[cat][{index}]", category);
+                }
+            }
+            else
+            {
+                parameters.Add("tor[cat][]", "0");
+            }
+
+            var urlSearch = SearchUrl;
+            if (parameters.Count > 0)
+            {
+                urlSearch += $"?{parameters.GetQueryString()}";
+            }
+
+            var response = await RequestWithCookiesAndRetryAsync(
+                urlSearch,
+                headers: new Dictionary<string, string>
+                {
+                    {"Accept", "application/json"}
+                });
+
+            if (response.ContentString.StartsWith("Error"))
+            {
+                throw new Exception(response.ContentString);
+            }
+
+            try
+            {
+                var sitelink = new Uri(SiteLink);
+
+                var jsonResponse = JsonConvert.DeserializeObject<MyAnonamouseResponse>(response.ContentString);
+
+                var error = jsonResponse.Error;
+                if (error.IsNotNullOrWhiteSpace() && error.StartsWithIgnoreCase("Nothing returned, out of"))
+                {
+                    return releases;
+                }
+
+                if (jsonResponse.Data == null)
+                {
+                    throw new Exception($"Unexpected response content from indexer request: {jsonResponse.Message ?? "Check the logs for more information."}");
+                }
+
+                foreach (var item in jsonResponse.Data)
+                {
+                    var id = item.Id;
+                    var link = new Uri(sitelink, $"/tor/download.php?tid={id}");
+                    var details = new Uri(sitelink, $"/t/{id}");
+
+                    var isFreeLeech = item.Free || item.PersonalFreeLeech;
+
+                    var release = new ReleaseInfo
+                    {
+                        Guid = details,
+                        Title = item.Title.Trim(),
+                        Description = item.Description.Trim(),
+                        Link = link,
+                        Details = details,
+                        Category = MapTrackerCatToNewznab(item.Category),
+                        PublishDate = DateTime.ParseExact(item.Added, "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal).ToLocalTime(),
+                        Grabs = item.Grabs,
+                        Files = item.NumFiles,
+                        Seeders = item.Seeders,
+                        Peers = item.Seeders + item.Leechers,
+                        Size = ParseUtil.GetBytes(item.Size),
+                        DownloadVolumeFactor = isFreeLeech ? 0 : 1,
+                        UploadVolumeFactor = 1,
+
+                        // MinimumRatio = 1, // global MR is 1.0 but torrents must be seeded for 3 days regardless of ratio
+                        MinimumSeedTime = 259200 // 72 hours
+                    };
+
+                    var authorInfo = item.AuthorInfo;
+                    if (authorInfo != null)
+                    {
+                        try
+                        {
+                            var authorInfoList = JsonConvert.DeserializeObject<Dictionary<string, string>>(authorInfo);
+                            var author = authorInfoList?.Take(5).Select(v => v.Value).ToList();
+
+                            if (author != null && author.Any())
+                            {
+                                release.Title += " by " + string.Join(", ", author);
+                            }
+                        }
+                        catch (Exception)
+                        {
+                            // the JSON on author_info field can be malformed due to double quotes
+                            logger.Warn($"{Name} error parsing author_info: {authorInfo}");
+                        }
+                    }
+
+                    var flags = new List<string>();
+
+                    var langCode = item.LanguageCode;
+                    if (!string.IsNullOrEmpty(langCode))
+                    {
+                        flags.Add(langCode);
+                    }
+
+                    var filetype = item.Filetype;
+                    if (!string.IsNullOrEmpty(filetype))
+                    {
+                        flags.Add(filetype.ToUpper());
+                    }
+
+                    if (flags.Count > 0)
+                    {
+                        release.Title += " [" + string.Join(" / ", flags) + "]";
+                    }
+
+                    if (item.Vip)
+                    {
+                        release.Title += " [VIP]";
+                    }
+
+                    releases.Add(release);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnParseError(response.ContentString, ex);
+            }
+
             return releases;
         }
 
@@ -198,6 +383,7 @@ namespace Jackett.Common.Indexers.Definitions
             {
                 logger.Debug("Attempting to use freeleech wedge for {0}", link.AbsoluteUri);
 
+                // Extract the torrent ID (tid) from the download link
                 var query = HttpUtility.ParseQueryString(link.Query);
                 if (int.TryParse(query["tid"], out var torrentId) && torrentId > 0)
                 {
@@ -214,31 +400,43 @@ namespace Jackett.Common.Indexers.Definitions
 
                     try
                     {
+                        // Execute the web request to buy the freeleech wedge
                         var response = await RequestWithCookiesAndRetryAsync(freeleechUrl);
                         var resource = JsonConvert.DeserializeObject<MyAnonamouseBuyPersonalFreeleechResponse>(response.ContentString);
 
                         if (resource.Success)
+                        {
                             logger.Info("Successfully used freeleech wedge for torrentid {0}.", torrentId);
+                        }
                         else if (resource.Error.IsNotNullOrWhiteSpace() && (resource.Error.Contains("This Torrent is VIP") || resource.Error.Contains("This is already a personal freeleech")))
+                        {
                             logger.Debug("Torrent {0} is already freeleech, continuing download: {1}", torrentId, resource.Error);
+                        }
                         else
                         {
                             logger.Warn("Failed to purchase freeleech wedge for {0}: {1}", torrentId, resource.Error);
                             if (freeleechWedgeAction == MyAnonamouseFreeleechWedgeAction.Required)
+                            {
                                 throw new Exception($"Failed to buy freeleech wedge (Required): {resource.Error}");
+                            }
                         }
                     }
                     catch (Exception ex)
                     {
                         logger.Warn("An exception occurred while trying to buy freeleech wedge for torrent {0}: {1}", torrentId, ex.Message);
                         if (freeleechWedgeAction == MyAnonamouseFreeleechWedgeAction.Required)
-                            throw;
+                        {
+                            throw; // Re-throw the exception to halt the download
+                        }
                     }
                 }
                 else
+                {
                     logger.Warn("Could not get torrent ID from link {0}, skipping use of freeleech wedge.", link.AbsoluteUri);
+                }
             }
 
+            // Finally, proceed with the original download behavior
             return await base.Download(link);
         }
     }
