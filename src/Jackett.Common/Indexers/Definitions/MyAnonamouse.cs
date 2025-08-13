@@ -15,6 +15,7 @@ using Jackett.Common.Utils.Clients;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using NLog;
+using System.Web; //SJ Mod
 
 namespace Jackett.Common.Indexers.Definitions
 {
@@ -370,7 +371,73 @@ namespace Jackett.Common.Indexers.Definitions
 
             return releases;
         }
+        public override async Task<IndexerDownloadResponse> Download(Uri link)
+{
+    // NOTE: In a future step, we will connect these to a real UI configuration.
+    // For now, we assume the feature is always enabled and set to "Preferred".
+    var useFreeleechWedge = true;
+    var freeleechWedgeAction = MyAnonamouseFreeleechWedgeAction.Preferred;
+
+    if (useFreeleechWedge)
+    {
+        logger.Debug("Attempting to use freeleech wedge for {0}", link.AbsoluteUri);
+
+        // Extract the torrent ID (tid) from the download link
+        var query = HttpUtility.ParseQueryString(link.Query);
+        if (int.TryParse(query["tid"], out var torrentId) && torrentId > 0)
+        {
+            var timestamp = DateTimeOffset.Now.ToUnixTimeSeconds();
+            var freeleechUrl = SiteLink + $"json/bonusBuy.php/{timestamp}";
+
+            var parameters = new NameValueCollection
+            {
+                { "spendtype", "personalFL" },
+                { "torrentid", torrentId.ToString() },
+                { "timestamp", timestamp.ToString() }
+            };
+            freeleechUrl += $"?{parameters.GetQueryString()}";
+
+            try
+            {
+                // Execute the web request to buy the freeleech wedge
+                var response = await RequestWithCookiesAndRetryAsync(freeleechUrl);
+                var resource = JsonConvert.DeserializeObject<MyAnonamouseBuyPersonalFreeleechResponse>(response.ContentString);
+
+                if (resource.Success)
+                {
+                    logger.Info("Successfully used freeleech wedge for torrentid {0}.", torrentId);
+                }
+                else if (resource.Error.IsNotNullOrWhiteSpace() && (resource.Error.Contains("This Torrent is VIP") || resource.Error.Contains("This is already a personal freeleech")))
+                {
+                    logger.Debug("Torrent {0} is already freeleech, continuing download: {1}", torrentId, resource.Error);
+                }
+                else
+                {
+                    logger.Warn("Failed to purchase freeleech wedge for {0}: {1}", torrentId, resource.Error);
+                    if (freeleechWedgeAction == MyAnonamouseFreeleechWedgeAction.Required)
+                    {
+                        throw new Exception($"Failed to buy freeleech wedge (Required): {resource.Error}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.Warn("An exception occurred while trying to buy freeleech wedge for torrent {0}: {1}", torrentId, ex.Message);
+                if (freeleechWedgeAction == MyAnonamouseFreeleechWedgeAction.Required)
+                {
+                    throw; // Re-throw the exception to halt the download
+                }
+            }
+        }
+        else
+        {
+            logger.Warn("Could not get torrent ID from link {0}, skipping use of freeleech wedge.", link.AbsoluteUri);
+        }
     }
+
+    // Finally, proceed with the original download behavior
+    return await base.Download(link);
+}
 
     public class MyAnonamouseResponse
     {
@@ -403,5 +470,16 @@ namespace Jackett.Common.Indexers.Definitions
         public int Leechers { get; set; }
         public int NumFiles { get; set; }
         public string Size { get; set; }
+    }
+    public enum MyAnonamouseFreeleechWedgeAction //SJ Mod
+    {
+        Preferred = 0,
+        Required = 1
+    }
+
+    public class MyAnonamouseBuyPersonalFreeleechResponse
+    {
+    public bool Success { get; set; }
+    public string Error { get; set; }
     }
 }
